@@ -1,0 +1,107 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [master, develop]
+  pull_request:
+    branches: [master, develop]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      zookeeper:
+        image: confluentinc/cp-zookeeper:7.4.0
+        ports: [2181:2181]
+        env:
+          ZOOKEEPER_CLIENT_PORT: 2181
+          ZOOKEEPER_TICK_TIME: 2000
+
+      kafka:
+        image: confluentinc/cp-kafka:7.4.0
+        ports: [9092:9092]
+        env:
+          KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+          KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+          KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v3
+
+    - name: Set up JDK 17
+      uses: actions/setup-java@v3
+      with:
+        java-version: '17'
+        distribution: 'temurin'
+        cache: 'maven'
+
+    - name: Run tests
+      run: mvn test -Dspring.kafka.bootstrap-servers=localhost:9092
+
+    - name: SonarQube Analysis
+      if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/develop'
+      run: |
+        mvn sonar:sonar \
+          -Dsonar.host.url=https://sonarcloud.io  \
+          -Dsonar.projectKey=kinoushamaye_e-commerce  \
+          -Dsonar.organization=mon-projet  \
+          -Dsonar.token=${{ secrets.SONAR_TOKEN }}
+
+  build-and-push:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: ["ms-orders", "ms-payment", "ms-stock"]
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v3
+      with:
+        fetch-depth: 0
+
+    - name: Debug Repository Structure
+      run: |
+        echo "Listing repository structure..."
+        ls -la
+
+    - name: Verify context exists
+      run: |
+        echo "Checking context directory: ${{ matrix.service }}"
+        if [ -d "${{ matrix.service }}" ]; then
+          echo "Context directory '${{ matrix.service }}' exists."
+        else
+          echo "Error: Context directory '${{ matrix.service }}' does not exist."
+          exit 1
+        fi
+
+    - name: Verify Dockerfiles exist
+      run: |
+        echo "Checking Dockerfile for ${{ matrix.service }}"
+        ls -la ./${{ matrix.service }} || echo "Directory ${{ matrix.service }} not found!"
+        ls -la ./${{ matrix.service }}/DockerFile || echo "DockerFile not found in ${{ matrix.service }}!"
+
+    - name: Log in to GitHub Container Registry
+      run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+    - name: Build app with Maven
+      run: mvn clean package -DskipTests
+      working-directory: ${{ matrix.service }}
+
+    - name: Build and push Docker image
+      uses: docker/build-push-action@v4
+      with:
+        context: ${{ matrix.service }}
+        file: ${{ matrix.service }}/DockerFile 
+        push: true
+        tags: |
+          ghcr.io/${{ github.repository_owner }}/${{ matrix.service }}:latest
+          ghcr.io/${{ github.repository_owner }}/${{ matrix.service }}:${{ github.sha }}
+
+    - name: Deploy to Kubernetes
+      if: github.ref == 'refs/heads/master'
+      run: |
+        echo "$KUBE_CONFIG" > kubeconfig.yaml
+        kubectl --kubeconfig=kubeconfig.yaml apply -f ./${{ matrix.service }}/k8s-deployment.yaml
+      env:
+        KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
